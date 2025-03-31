@@ -1,227 +1,327 @@
-import json
-import psutil
-import time
-import csv
-import datetime
-import os
-import threading
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, messagebox
+import psutil
+import json
+import os
+import speech_recognition as sr  
+import pyttsx3                 
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import time
 
-# Configuration file handling
-CONFIG_FILE = os.path.join(os.getenv('APPDATA'), 'ProcessMonitorConfig.json')
+engine = pyttsx3.init()
+engine.setProperty('rate', 150)
+def speak(text):
+    engine.say(text)
+    engine.runAndWait()
 
-def get_default_location():
-    """Get the default location from config file or return system default"""
-    try:
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, 'r') as f:
-                config = json.load(f)
-                return config.get('last_location', get_fallback_location())
-        return get_fallback_location()
-    except Exception:
-        return get_fallback_location()
+# === Feedback DB ===
+FEEDBACK_FILE = "feedback.json"
 
-def get_fallback_location():
-    """Fallback to original default if everything fails"""
-    return os.path.join(os.path.expanduser('~'), 'Desktop', 'Os Project', 'logs')
+def load_feedback():
+    if os.path.exists(FEEDBACK_FILE):
+        with open(FEEDBACK_FILE, "r") as f:
+            return json.load(f)
+    return {}
 
-def save_location(location):
-    """Save the selected location to config file"""
-    config = {'last_location': location}
-    try:
-        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump(config, f)
-    except Exception as e:
-        print(f"Error saving config: {e}")
+def save_feedback():
+    with open(FEEDBACK_FILE, "w") as f:
+        json.dump(feedback, f, indent=4)
 
-# -----------------------
-# Helper: Append Data to CSV
-# -----------------------
-def append_to_csv(new_data, filename="process_data.csv", location=None):
-    """Appends process data to CSV with error handling."""
-    if not new_data:
+feedback = load_feedback()
+
+# === Process Monitoring ===
+def get_processes():
+    processes = []
+    for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
+        try:
+            info = proc.info
+            processes.append(info)
+        except psutil.NoSuchProcess:
+            pass
+    return processes
+
+def refresh_processes():
+    # Clear the tree view
+    for row in tree.get_children():
+        tree.delete(row)
+
+    processes = get_processes()
+    grouped = {}
+    for proc in processes:
+        name = proc['name']
+        if name not in grouped:
+            grouped[name] = {
+                'pids': [],
+                'cpu': 0.0,
+                'memory': 0.0,
+                'count': 0
+            }
+        grouped[name]['pids'].append(proc['pid'])
+        grouped[name]['cpu'] += proc['cpu_percent']
+        grouped[name]['memory'] += proc['memory_percent']
+        grouped[name]['count'] += 1
+
+    for name, info in grouped.items():
+        status = ""
+        if info['cpu'] > 50:
+            status = "High CPU"
+        elif info['memory'] > 50:
+            status = "High Memory"
+
+        tree.insert("", "end", values=(
+            ", ".join(map(str, info['pids'])),
+            f"{name} (x{info['count']})",
+            f"{info['cpu']}%",
+            f"{round(info['memory'], 2)}%",
+            status
+        ))
+    set_status("Process list refreshed and grouped.")
+
+def lower_priority():
+    selected = tree.selection()
+    if not selected:
+        messagebox.showinfo("Info", "Please select a process group first.")
         return
 
-    try:
-        if not os.path.exists(location):
-            os.makedirs(location)
+    pids = tree.item(selected[0])['values'][0].split(", ")
+    name = tree.item(selected[0])['values'][1]
+    confirm = messagebox.askyesno("Suggestion", f"Process group '{name}' is consuming high resources.\nLower priority for the first instance?")
+    
+    if confirm:
+        try:
+            pid = int(pids[0])
+            proc = psutil.Process(pid)
+            proc.nice(10)
+            feedback[str(pid)] = "lowered"
+            save_feedback()
+            set_status(f"Priority of '{name}' lowered.")
+            speak(f"Priority of {name} lowered.")
+            refresh_processes()
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+            set_status(f"Error: {e}")
 
-        full_path = os.path.join(location, filename)
-        file_exists = os.path.isfile(full_path)
-        fieldnames = list(new_data[0].keys())
+def run_command(cmd=None):
+    if cmd is None:
+        cmd = command_entry.get().lower().strip()
+    else:
+        command_entry.delete(0, tk.END)
+        command_entry.insert(0, cmd)
+    
+    if not cmd:
+        set_status("Please enter a command.")
+        return
 
-        with open(full_path, 'a', newline='') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            if not file_exists:
-                writer.writeheader()
-            writer.writerows(new_data)
-
-        print(f"Appended {len(new_data)} rows to {full_path}")
-    except Exception as e:
-        messagebox.showerror("File Error", f"Error writing to CSV:\n{str(e)}")
-
-# -----------------------
-# Background Data Collector
-# -----------------------
-class DataCollectorThread(threading.Thread):
-    def __init__(self, sampling_interval=5, stop_event=None, 
-                 filename="process_data.csv", location=None):
-        super().__init__()
-        self.sampling_interval = sampling_interval
-        self.stop_event = stop_event or threading.Event()
-        self.filename = filename
-        self.location = location or get_default_location()
-        self.data = []
-
-    def run(self):
-        while not self.stop_event.is_set():
-            new_rows = []
-            timestamp = datetime.datetime.now().isoformat()
-            
-            for proc in psutil.process_iter(attrs=['pid', 'name']):
+    response = ""
+    
+    if "open" in cmd:
+        app = cmd.replace("open", "").strip()
+        os.system(f"start {app}")
+        response = f"Opening {app}"
+    
+    elif "search" in cmd:
+        response = "Search functionality coming soon!"
+        messagebox.showinfo("Search", response)
+    
+    elif "kill" in cmd or "close" in cmd:
+        app = cmd.replace("kill", "").replace("close", "").strip()
+        if not app:
+            response = "Please specify a process to kill."
+        else:
+            matched_processes = []
+            for proc in psutil.process_iter(['pid', 'name']):
                 try:
-                    cpu_usage = proc.cpu_percent(interval=0.1) / psutil.cpu_count()
-                    memory_usage = proc.memory_info().rss / (1024 * 1024)
-                    
-                    new_rows.append({
-                        "timestamp": timestamp,
-                        "pid": proc.info['pid'],
-                        "name": proc.info['name'],
-                        "cpu_usage": cpu_usage,
-                        "memory_usage_MB": memory_usage
-                    })
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    if app.lower() in proc.info['name'].lower():
+                        matched_processes.append(proc)
+                except psutil.NoSuchProcess:
                     continue
 
-            self.data.extend(new_rows)
-            append_to_csv(new_rows, filename=self.filename, location=self.location)
-            time.sleep(self.sampling_interval)
+            if matched_processes:
+                confirm = messagebox.askyesno("Confirm Kill", f"Are you sure you want to close '{app}'?")
+                if confirm:
+                    for proc in matched_processes:
+                        try:
+                            proc.terminate()
+                            response = f"Killed {proc.info['name']} (PID: {proc.info['pid']})"
+                        except psutil.NoSuchProcess:
+                            continue
+            else:
+                response = f"No process found matching '{app}'."
+        messagebox.showinfo("Kill Command", response)
+    
+    else:
+        response = "Unknown command. Try 'open', 'search', or 'kill'."
+        messagebox.showinfo("Unknown Command", response)
+    
+    set_status(response)
+    speak(response)
 
-# -----------------------
-# Enhanced Tkinter GUI
-# -----------------------
-class ProcessMonitorApp:
-    def __init__(self, root):
-        self.root = root
-        self.collector_thread = None
-        self.stop_event = None
-        self.setup_ui()
-        
-    def setup_ui(self):
-        # Configure style
-        self.style = ttk.Style()
-        self.style.theme_use('clam')
-        self.style.configure('TButton', padding=6, relief='flat')
-        self.style.configure('Red.TButton', foreground='red')
-        self.style.configure('Green.TButton', foreground='green')
-        self.style.configure('Status.TLabel', padding=10, font=('Arial', 10))
-
-        # Main container
-        main_frame = ttk.Frame(self.root, padding=20)
-        main_frame.pack(fill=tk.BOTH, expand=True)
-
-        # Directory selection
-        dir_frame = ttk.LabelFrame(main_frame, text=" Save Location ", padding=10)
-        dir_frame.grid(row=0, column=0, sticky='we', pady=5)
-        
-        self.location_entry = ttk.Entry(dir_frame, width=50)
-        self.location_entry.grid(row=0, column=0, padx=5)
-        self.location_entry.insert(0, get_default_location())
-        
-        ttk.Button(dir_frame, text="Browse", command=self.choose_directory)\
-            .grid(row=0, column=1, padx=5)
-
-        # Settings
-        settings_frame = ttk.LabelFrame(main_frame, text=" Settings ", padding=10)
-        settings_frame.grid(row=1, column=0, sticky='we', pady=5)
-        
-        ttk.Label(settings_frame, text="Filename:").grid(row=0, column=0, sticky='e')
-        self.filename_entry = ttk.Entry(settings_frame, width=25)
-        self.filename_entry.grid(row=0, column=1, padx=5, pady=2)
-        self.filename_entry.insert(0, "process_data.csv")
-        
-        ttk.Label(settings_frame, text="Interval (sec):").grid(row=1, column=0, sticky='e')
-        self.interval_spin = ttk.Spinbox(settings_frame, from_=1, to=60, width=5)
-        self.interval_spin.grid(row=1, column=1, padx=5, pady=2, sticky='w')
-        self.interval_spin.set(5)
-
-        # Controls
-        control_frame = ttk.Frame(main_frame)
-        control_frame.grid(row=2, column=0, pady=10)
-        
-        self.start_btn = ttk.Button(control_frame, text="Start Monitoring", 
-                                  command=self.start_collection, style='Green.TButton')
-        self.start_btn.pack(side=tk.LEFT, padx=5)
-        
-        self.stop_btn = ttk.Button(control_frame, text="Stop Monitoring", 
-                                 command=self.stop_collection, style='Red.TButton', state=tk.DISABLED)
-        self.stop_btn.pack(side=tk.LEFT, padx=5)
-
-        # Status
-        self.status_label = ttk.Label(main_frame, text="Status: Ready", style='Status.TLabel')
-        self.status_label.grid(row=3, column=0)
-        
-        self.progress = ttk.Progressbar(main_frame, mode='indeterminate')
-        self.progress.grid(row=4, column=0, sticky='we', pady=10)
-
-        # Configure grid weights
-        main_frame.columnconfigure(0, weight=1)
-        dir_frame.columnconfigure(0, weight=1)
-
-    def choose_directory(self):
-        directory = filedialog.askdirectory()
-        if directory:
-            self.location_entry.delete(0, tk.END)
-            self.location_entry.insert(0, directory)
-            save_location(directory)
-
-    def start_collection(self):
-        location = self.location_entry.get()
-        filename = self.filename_entry.get()
-        
-        if not os.path.isdir(location):
-            messagebox.showerror("Error", "Invalid directory path!")
-            return
-            
+def start_listening():
+    recording_var.set("Recording...")
+    set_status("Listening...")
+    root.update_idletasks()  # Force UI update
+    r = sr.Recognizer()
+    with sr.Microphone() as source:
         try:
-            interval = int(self.interval_spin.get())
-            if interval < 1:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("Error", "Please enter a valid interval (1-60 seconds)")
-            return
+            # Adjust for ambient noise
+            r.adjust_for_ambient_noise(source, duration=1)
+            print("Adjusted for ambient noise. Listening now...")
+            audio = r.listen(source, timeout=5)
+            print("Audio captured, processing...")
+            command = r.recognize_google(audio)
+            print(f"Recognized command: {command}")
+            set_status(f"You said: {command}")
+            speak(f"You said: {command}")
+            run_command(command.lower().strip())
+        except sr.UnknownValueError:
+            set_status("Could not understand audio.")
+            speak("I could not understand what you said.")
+            print("Speech recognition could not understand audio.")
+        except sr.RequestError as e:
+            set_status(f"Speech recognition error: {e}")
+            speak("There was an error with the speech recognition service.")
+            print(f"Request error: {e}")
+        except sr.WaitTimeoutError:
+            set_status("Listening timed out. Please try again.")
+            speak("Listening timed out. Please try again.")
+            print("Listening timed out.")
+        except Exception as e:
+            set_status(f"Error: {e}")
+            speak("An error occurred during listening.")
+            print(f"Unexpected error: {e}")
+        finally:
+            recording_var.set("Not Recording")
+            root.update_idletasks()  # Force UI update
 
-        save_location(location)  # Save the location when starting
-        
-        self.stop_event = threading.Event()
-        self.collector_thread = DataCollectorThread(
-            sampling_interval=interval,
-            stop_event=self.stop_event,
-            filename=filename,
-            location=location
-        )
-        
-        self.collector_thread.start()
-        self.status_label.config(text="Status: Collecting data...", foreground='green')
-        self.start_btn.config(state=tk.DISABLED)
-        self.stop_btn.config(state=tk.NORMAL)
-        self.progress.start()
+def set_status(msg):
+    status_var.set(msg)
 
-    def stop_collection(self):
-        if self.stop_event and self.collector_thread:
-            self.stop_event.set()
-            self.collector_thread.join()
-            self.status_label.config(text="Status: Stopped", foreground='red')
-            self.start_btn.config(state=tk.NORMAL)
-            self.stop_btn.config(state=tk.DISABLED)
-            self.progress.stop()
+# === System Monitoring Graphs ===
+cpu_history = []
+mem_history = []
+time_history = []
 
-# Run the application
-if __name__ == "__main__":
-    root = tk.Tk()
-    root.title("Process Monitor Pro")
-    root.geometry("600x400")
-    app = ProcessMonitorApp(root)
-    root.mainloop()
+def update_graphs():
+    cpu_percent = psutil.cpu_percent()
+    mem_percent = psutil.virtual_memory().percent
+    current_time = time.time()
+
+    cpu_history.append(cpu_percent)
+    mem_history.append(mem_percent)
+    time_history.append(current_time)
+
+    # Keep only the last 60 data points
+    if len(cpu_history) > 60:
+        cpu_history.pop(0)
+        mem_history.pop(0)
+        time_history.pop(0)
+
+    cpu_ax.clear()
+    mem_ax.clear()
+
+    cpu_ax.plot(time_history, cpu_history, 'b-')
+    cpu_ax.set_title('CPU Usage')
+    cpu_ax.set_ylim(0, 100)
+    cpu_ax.set_ylabel('Usage (%)')
+    cpu_ax.set_xlabel('Time (s)')
+
+    mem_ax.plot(time_history, mem_history, 'r-')
+    mem_ax.set_title('Memory Usage')
+    mem_ax.set_ylim(0, 100)
+    mem_ax.set_ylabel('Usage (%)')
+    mem_ax.set_xlabel('Time (s)')
+
+    if time_history:
+        start_time = time_history[0]
+        ticks = [start_time + i*10 for i in range(int((time_history[-1]-start_time)/10)+1)]
+        labels = [f"{i:.1f}s" for i in range(0, int((time_history[-1]-start_time)//10)*10+1, 10)]
+        cpu_ax.set_xticks(ticks)
+        cpu_ax.set_xticklabels(labels)
+        mem_ax.set_xticks(cpu_ax.get_xticks())
+        mem_ax.set_xticklabels(cpu_ax.get_xticklabels())
+
+    canvas.draw()
+    root.after(1000, update_graphs)
+
+root = tk.Tk()
+root.title("AI-Enhanced Smart Task Manager")
+root.geometry("900x700")
+
+# Create main frame
+main_frame = ttk.Frame(root)
+main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+# Create dashboard frame for graphs
+dashboard_frame = ttk.LabelFrame(main_frame, text="System Dashboard", padding=10)
+dashboard_frame.pack(fill=tk.BOTH, expand=False, padx=10, pady=10)
+
+# Create figure and subplots
+fig = plt.Figure(figsize=(9, 3), dpi=100)
+cpu_ax = fig.add_subplot(121)
+mem_ax = fig.add_subplot(122)
+
+# Create canvas to display the figure
+canvas = FigureCanvasTkAgg(fig, master=dashboard_frame)
+canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+# Process Manager Section
+process_manager_frame = ttk.LabelFrame(main_frame, text="Process Manager", padding=10)
+process_manager_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+tree_frame = ttk.Frame(process_manager_frame)
+tree_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+tree = ttk.Treeview(tree_frame, columns=('PIDs', 'Name', 'CPU %', 'Memory %', 'Status'),
+                    show='headings')
+for col in ('PIDs', 'Name', 'CPU %', 'Memory %', 'Status'):
+    tree.heading(col, text=col)
+    tree.column(col, anchor=tk.CENTER, width=140)
+tree.pack(fill=tk.BOTH, expand=True)
+
+btn_frame = ttk.Frame(process_manager_frame)
+btn_frame.pack(pady=5)
+ttk.Button(btn_frame, text="Refresh", command=refresh_processes).pack(side=tk.LEFT, padx=10)
+ttk.Button(btn_frame, text="Lower Priority", command=lower_priority).pack(side=tk.LEFT, padx=10)
+
+# Virtual Assistant Section
+va_frame = ttk.LabelFrame(main_frame, text="Virtual Assistant", padding=10)
+va_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+ttk.Label(va_frame, text="Enter command (e.g., 'open chrome', 'kill notepad'):", font=("Arial", 12)).pack(pady=5)
+command_entry = ttk.Entry(va_frame, width=60, font=("Arial", 12))
+command_entry.pack(pady=5)
+
+# Recording Status Indicator
+recording_var = tk.StringVar(value="Not Recording")
+recording_label = ttk.Label(va_frame, textvariable=recording_var, font=("Arial", 10), foreground="red")
+recording_label.pack(pady=5)
+
+va_btn_frame = ttk.Frame(va_frame)
+va_btn_frame.pack(pady=5)
+ttk.Button(va_btn_frame, text="Run", command=lambda: run_command()).pack(side=tk.LEFT, padx=10)
+ttk.Button(va_btn_frame, text="Listen", command=start_listening).pack(side=tk.LEFT, padx=10)
+
+# Status Bar
+status_var = tk.StringVar()
+status_var.set("Ready")
+status_bar = ttk.Label(root, textvariable=status_var, relief=tk.SUNKEN, anchor=tk.W, padding=5, font=("Arial", 10))
+status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+# Pre-initialize CPU usage readings
+psutil.cpu_percent(interval=0.1)
+for proc in psutil.process_iter():
+    try:
+        proc.cpu_percent(interval=None)
+    except Exception:
+        pass
+
+# Start live updates
+def live_update():
+    refresh_processes()
+    update_graphs()
+    root.after(1000, live_update)
+
+live_update()
+
+root.mainloop()
